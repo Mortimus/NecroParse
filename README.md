@@ -1,0 +1,1 @@
+NecroParse helps track dots by reminding you when 1 tick is remaining on the dot
