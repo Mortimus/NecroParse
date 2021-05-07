@@ -1,458 +1,297 @@
 package main
 
 import (
-	"bufio"
-	"fmt"
-	"io"
+	"crypto/md5"
+	"encoding/hex"
+	"io/ioutil"
 	"log"
 	"os"
 	"regexp"
-	"strings"
 	"time"
 
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/data/binding"
+	"fyne.io/fyne/v2/widget"
+	everquest "github.com/Mortimus/goEverquest"
 	"github.com/faiface/beep"
 	"github.com/faiface/beep/mp3"
 	"github.com/faiface/beep/speaker"
 	htgotts "github.com/hegedustibor/htgo-tts"
 )
 
-// Spells is all known necro spell
-var Spells []Spell
-var activeSpells = make(map[string]int)
-var tarMob string
+var Debug, Warn, Err, Info *log.Logger
+var SpellDB everquest.SpellDB
+var activeMob binding.String
+
+func init() {
+	// Initialize log handlers
+	LogFile, err := os.OpenFile(configuration.Log.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+	if err != nil {
+		log.Fatal(err)
+	}
+	Warn = log.New(LogFile, "[WARN] ", log.Lshortfile|log.Ldate|log.Ltime|log.LUTC|log.Lmsgprefix)
+	Err = log.New(LogFile, "[ERR] ", log.Lshortfile|log.Ldate|log.Ltime|log.LUTC|log.Lmsgprefix)
+	Info = log.New(LogFile, "[INFO] ", log.Lshortfile|log.Ldate|log.Ltime|log.LUTC|log.Lmsgprefix)
+	Debug = log.New(LogFile, "[DEBUG] ", log.Lshortfile|log.Ldate|log.Ltime|log.LUTC|log.Lmsgprefix)
+	if configuration.Log.Level < 0 {
+		Warn.SetOutput(ioutil.Discard)
+	}
+	if configuration.Log.Level < 1 {
+		Err.SetOutput(ioutil.Discard)
+	}
+	if configuration.Log.Level < 2 {
+		Info.SetOutput(ioutil.Discard)
+	}
+	if configuration.Log.Level < 3 {
+		Debug.SetOutput(ioutil.Discard)
+	}
+	SpellDB.LoadFromFile(configuration.Everquest.SpellDB, Err)
+}
 
 func main() {
-	// Open Configuration and set log output
-	configFile, err := os.OpenFile(configuration.LogPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatalf("error opening file: %v", err)
-	}
-	defer configFile.Close()
-	log.SetOutput(configFile)
-	l := LogInit("main-main.go")
-	defer l.End()
-	seedSpells()
-	bufferedRead(configuration.EQLogPath, configuration.ReadEntireLog)
+	Debug.Printf("Using Config\n%#+v", configuration)
+	// kiss := findSpellIDByName("Saryrn's Kiss")
+	// kissS := SpellDB.GetSpellByID(kiss)
+	// fmt.Printf("Kiss\n%#+v\n", kissS)
+	// return
+	ChatLogs := make(chan everquest.EqLog)
+	go everquest.BufferedLogRead(configuration.Everquest.LogPath, configuration.Main.ReadEntireLog, configuration.Main.LogPollRate, ChatLogs)
+	myApp := app.New()
+	myWindow := myApp.NewWindow("NecroParse")
+
+	activeMob = binding.NewString()
+	activeMob.Set("None")
+	mobLabel := widget.NewLabelWithData(activeMob)
+
+	content := container.NewVBox(
+		mobLabel, // We need data binding for this
+	)
+	go parseLogs(content, ChatLogs)
+
+	myWindow.SetContent(content)
+	myWindow.ShowAndRun()
 }
 
-func bufferedRead(path string, fromStart bool) {
-	file, err := os.Open(path)
-	if err != nil {
-		log.Fatalf("error opening buffered file: %v", err)
-	}
-	if !fromStart {
-		file.Seek(0, 2) // move to end of file
-	}
-	bufferedReader := bufio.NewReader(file)
-	r, _ := regexp.Compile(configuration.EQBaseLogLine)
-	for {
-		str, err := bufferedReader.ReadString('\n')
-		if err == io.EOF {
-			time.Sleep(time.Duration(configuration.LogPollRate) * time.Second) // 1 eq tick = 6 seconds
-			continue
+func parseLogs(ui *fyne.Container, logs chan everquest.EqLog) {
+	for l := range logs { // handle all logs in the channel
+		if l.Channel == "system" { // Spells are "system" level logs, so we can drop the rest
+			processLog(ui, l)
 		}
-		if err != nil {
-			log.Fatalf("error opening buffered file: %v", err)
-		}
+	}
+}
 
-		results := r.FindAllStringSubmatch(str, -1) // this really needs converted to single search
-		if results == nil {
-			time.Sleep(3 * time.Second)
+// Gangrenous Touch of Zum'uul
+// Gangrenous Touch of Zum`uul
+// TODO: update everquest package to change ` to '
+
+func processLog(ui *fyne.Container, l everquest.EqLog) {
+	if configuration.Main.ReadEntireLog { // slow things down so we can watch parser working
+		time.Sleep(1 * time.Millisecond)
+	}
+	// TODO: update mob name based on cast on other text if trigger time+spell cast time(include haste) -- we'll have to account for that cleric haste spell too
+	// Debug.Printf("Processing: %s\n", l.Msg)
+	r, _ := regexp.Compile(configuration.Everquest.TakenDamageRegex)
+	result := r.FindStringSubmatch(l.Msg)
+	if len(result) > 0 {
+		activeMob.Set(result[1])
+		Debug.Printf("Handling damage taken: %s", l.Msg)
+		spellID := findSpellIDByName(result[3])
+		if spellID != -1 { // we found the spell
+			spell := SpellDB.GetSpellByID(spellID)
+			if spell.Spelltype != "Detrimental" || spell.Duration <= 0 {
+				Debug.Printf("Non long term Detrimental spell, ignoring: %d:%s", spell.Id, spell.Name)
+				return
+			}
+			if _, ok := active[spell.Name]; ok {
+				index := findSpellInstance(result[1], spell.Name)
+				if index >= 0 {
+					if (*active[spell.Name])[index].target != "Unknown" {
+						Debug.Printf("Handling first tick of spell %s on %s", spell.Name, result[1])
+						// Check if an unknown exists for this spell, if so reset ticks and remove the unknown
+						uIndex := findSpellInstance("Unknown", spell.Name)
+						if uIndex >= 0 {
+							Debug.Printf("Removing old instances of %s", spell.Name)
+							(*active[spell.Name])[index].ticks = 0
+							removeInstance(uIndex, spell.Name)
+							index = findSpellInstance(result[1], spell.Name) // need to re-find instance
+							if index < 0 {
+								Err.Printf("Cannot find index after removing old instances")
+								return
+							}
+						}
+					}
+					(*active[spell.Name])[index].target = result[1]
+					(*active[spell.Name])[index].tick()
+				}
+			}
 		} else {
-			t := eqTimeConv(results[0][1])
-			msg := strings.TrimSuffix(results[0][2], "\r")
-			l := &EqLog{
-				t:       t,
-				msg:     msg,
-				channel: getChannel(msg),
-			}
-			parseLogLine(*l)
+			Err.Printf("Cannot find spell %s\n", result[3])
 		}
+		return
 	}
-}
-
-func eqTimeConv(t string) time.Time {
-	// Get local time zone
-	localT := time.Now()
-	zone, _ := localT.Zone()
-	// fmt.Println(zone, offset)
-
-	// Parse Time
-	cTime, err := time.Parse("Mon Jan 02 15:04:05 2006 MST", t+" "+zone)
-	if err != nil {
-		fmt.Printf("Error parsing time, defaulting to now: %s\n", err.Error())
-		cTime = time.Now()
+	// You begin casting (.+).
+	r, _ = regexp.Compile(configuration.Everquest.BeginCastingRegex)
+	result = r.FindStringSubmatch(l.Msg)
+	if len(result) > 0 {
+		Debug.Printf("Handling begin casting: %s", l.Msg)
+		spellID := findSpellIDByName(result[1])
+		if spellID != -1 { // we found the spell
+			spell := SpellDB.GetSpellByID(spellID)
+			if spell.Spelltype != "Detrimental" || spell.Duration <= 0 {
+				Debug.Printf("Non long term Detrimental spell, ignoring: %d:%s", spell.Id, spell.Name)
+				return
+			}
+			a := &ActiveSpell{}
+			a.set(ui, spell)
+			if active[spell.Name] == nil {
+				act := &[]ActiveSpell{}
+				active[spell.Name] = act
+			}
+			*active[spell.Name] = append(*active[spell.Name], *a)
+		} else {
+			Err.Printf("Cannot find spell %s\n", result[1])
+		}
+		return
 	}
-	return cTime
-}
-
-// EqLog represents a single line of eq logging
-type EqLog struct {
-	t       time.Time
-	msg     string
-	channel string
-}
-
-func getChannel(msg string) string {
-	m := strings.Split(msg, " ")
-	if len(m) > 1 && m[1] == "tells" {
-		// return m[3]
-		return strings.TrimRight(m[3], ",")
+	// Your (.+) spell is interrupted.
+	r, _ = regexp.Compile(configuration.Everquest.InterruptedRegex)
+	result = r.FindStringSubmatch(l.Msg)
+	if len(result) > 0 {
+		Debug.Printf("Handling spell interrupted: %s", l.Msg)
+		if _, ok := active[result[1]]; ok {
+			index := findSpellInstance("Unknown", result[1])
+			if index >= 0 {
+				(*active[result[1]])[index].cleanup()
+				removeInstance(index, result[1])
+			}
+		}
+		return
 	}
-	return "system"
-}
-
-func parseLogLine(l EqLog) {
-
-	if l.channel == "system" {
-		r, _ := regexp.Compile(`(.+) has taken (\d+) damage from your (.+).`)
-		result := r.FindStringSubmatch(l.msg)
-		if len(result) > 0 {
-			// fmt.Printf("%s: %#v\n", l.t.String(), result)
-			if checkKnownSpell(result[3]) {
-				if val, ok := activeSpells[result[3]]; ok {
-					activeSpells[result[3]] = val + 1
+	// Your (.+) spell fizzles!
+	r, _ = regexp.Compile(configuration.Everquest.FizzledRegex)
+	result = r.FindStringSubmatch(l.Msg)
+	if len(result) > 0 {
+		Debug.Printf("Handling fizzle: %s", l.Msg)
+		if _, ok := active[result[1]]; ok {
+			index := findSpellInstance("Unknown", result[1])
+			if index >= 0 {
+				(*active[result[1]])[index].cleanup()
+				removeInstance(index, result[1])
+			}
+		}
+		return
+	}
+	// Your (.+) spell has worn off of (.*).
+	r, _ = regexp.Compile(configuration.Everquest.WornOffRegex)
+	result = r.FindStringSubmatch(l.Msg)
+	if len(result) > 0 {
+		activeMob.Set(result[2])
+		Debug.Printf("Handling worn off: %s", l.Msg)
+		if _, ok := active[result[1]]; ok {
+			index := findSpellInstance(result[2], result[1])
+			if index >= 0 {
+				(*active[result[1]])[index].cleanup()
+				removeInstance(index, result[1])
+			}
+		}
+		// TODO: Alert the spell has worn off
+		return
+	}
+	// Your (.+) spell on (.+) has been overwritten.
+	r, _ = regexp.Compile(configuration.Everquest.OverwrittenRegex)
+	result = r.FindStringSubmatch(l.Msg)
+	if len(result) > 0 {
+		activeMob.Set(result[2])
+		Debug.Printf("Handling overwritten: %s", l.Msg)
+		if _, ok := active[result[1]]; ok {
+			index := findSpellInstance(result[2], result[1])
+			if index >= 0 {
+				(*active[result[1]])[index].cleanup()
+				removeInstance(index, result[1])
+			}
+		}
+		// TODO: Alert the spell has been overwritten
+		return
+	}
+	// (.+) has been slain by (.+)!
+	r, _ = regexp.Compile(configuration.Everquest.KilledRegex)
+	result = r.FindStringSubmatch(l.Msg)
+	if len(result) > 0 {
+		// TODO: Account for multiple mobs
+		found := cleanupMob(result[1])
+		if found > 0 { // Only update current target if we had a dot on the now dead mob
+			Debug.Printf("Handling npc death: %s", l.Msg)
+			activeMob.Set("None")
+		}
+		return
+	}
+	// (You) have been slain by (.+)!
+	r, _ = regexp.Compile(configuration.Everquest.DiedRegex)
+	result = r.FindStringSubmatch(l.Msg)
+	if len(result) > 0 {
+		Debug.Printf("Handling self death: %s", l.Msg)
+		cleanupAll()
+		activeMob.Set("None")
+		return
+	}
+	// (.+) resisted your (.+)!
+	r, _ = regexp.Compile(configuration.Everquest.ResistedRegex)
+	result = r.FindStringSubmatch(l.Msg)
+	if len(result) > 0 {
+		activeMob.Set(result[1])
+		Debug.Printf("Handling resist: %s", l.Msg)
+		if _, ok := active[result[2]]; ok {
+			index := findSpellInstance("Unknown", result[2])
+			if index >= 0 {
+				if active[result[1]] != nil {
+					(*active[result[1]])[index].cleanup()
+					removeInstance(index, result[1])
 				}
-				if (getMaxTicks(result[3]) - activeSpells[result[3]]) <= configuration.TickAlert {
-					fmt.Printf("WARNING: %s has %d tick left\n", result[3], getMaxTicks(result[3])-activeSpells[result[3]])
-					playAudio(result[3])
-				}
-				tarMob = result[1]
 			}
-			return
 		}
-		// You begin casting (.+).
-		r, _ = regexp.Compile(`You begin casting (.+).`)
-		result = r.FindStringSubmatch(l.msg)
-		if len(result) > 0 {
-			if checkKnownSpell(result[1]) {
-				// fmt.Printf("%s: %#v\n", l.t.String(), result)
-				activeSpells[result[1]] = 0
-			}
-			return
-		}
-		// Your (.+) spell is interrupted.
-		r, _ = regexp.Compile(`Your (.+) spell is interrupted.`)
-		result = r.FindStringSubmatch(l.msg)
-		if len(result) > 0 {
-			// fmt.Printf("%s: %#v\n", l.t.String(), result)
-			if checkKnownSpell(result[1]) {
-				if _, ok := activeSpells[result[1]]; ok {
-					delete(activeSpells, result[1])
-				}
-			}
-			return
-		}
-		// Your (.+) spell fizzles!
-		r, _ = regexp.Compile(`Your (.+) spell fizzles!`)
-		result = r.FindStringSubmatch(l.msg)
-		if len(result) > 0 {
-			// fmt.Printf("%s: %#v\n", l.t.String(), result)
-			if checkKnownSpell(result[1]) {
-				if _, ok := activeSpells[result[1]]; ok {
-					delete(activeSpells, result[1])
-				}
-			}
-			return
-		}
-		// Your (.+) spell has worn off of (.*).
-		r, _ = regexp.Compile(`Your (.+) spell has worn off of (.*).`)
-		result = r.FindStringSubmatch(l.msg)
-		if len(result) > 0 {
-			// fmt.Printf("%s: %#v\n", l.t.String(), result)
-			if checkKnownSpell(result[1]) {
-				if _, ok := activeSpells[result[1]]; ok {
-					delete(activeSpells, result[1])
-				}
-				playAudio(result[1])
-				tarMob = result[2]
-			}
-			return
-		}
-		// Your (.+) spell on (.+) has been overwritten.
-		r, _ = regexp.Compile(`Your (.+) spell on (.+) has been overwritten.`)
-		result = r.FindStringSubmatch(l.msg)
-		if len(result) > 0 {
-			// fmt.Printf("%s: %#v\n", l.t.String(), result)
-			if checkKnownSpell(result[1]) {
-				if _, ok := activeSpells[result[1]]; ok {
-					delete(activeSpells, result[1])
-				}
-				fmt.Printf("WARNING: %s has been overwritten\n", result[1])
-				playAudio(result[1])
-				tarMob = result[2]
-			}
-			return
-		}
-		// (.+) has been slain by (.+)!
-		r, _ = regexp.Compile(`(.+) has been slain by (.+)!`)
-		result = r.FindStringSubmatch(l.msg)
-		if len(result) > 0 {
-			// fmt.Printf("%s: %#v\n", l.t.String(), result)
-			// TODO: Clear map if mob is the one we were dotting
-			if strings.Compare(tarMob, result[1]) == 0 {
-				fmt.Printf("Done[%s]: %#v\n", result[1], activeSpells)
-				activeSpells = make(map[string]int)
-			}
-			return
-		}
-		// (You) have been slain by (.+)!
-		r, _ = regexp.Compile(`(You) have been slain by (.+)!`)
-		result = r.FindStringSubmatch(l.msg)
-		if len(result) > 0 {
-			// fmt.Printf("%s: %#v\n", l.t.String(), result)
-			activeSpells = make(map[string]int)
-			return
-		}
-		// (.+) resisted your (.+)!
-		r, _ = regexp.Compile(`(.+) resisted your (.+)!`)
-		result = r.FindStringSubmatch(l.msg)
-		if len(result) > 0 {
-			// fmt.Printf("%s: %#v\n", l.t.String(), result)
-			if checkKnownSpell(result[2]) {
-				if _, ok := activeSpells[result[2]]; ok {
-					delete(activeSpells, result[2])
-				}
-				tarMob = result[1]
-			}
-			return
-		}
+		// TODO: Alert the spell has been resisted
+		return
 	}
 }
 
-// Spell defines a spell and its statistics
-type Spell struct {
-	name     string
-	castTime float32
-	ticks    int
-	reuse    float32
-	fizzle   float32
-}
-
-func seedSpells() {
-	s := Spell{
-		name:     "Ancient: Lifebane",
-		castTime: 5.0,
-		ticks:    0,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Trucidation",
-		castTime: 3.2,
-		ticks:    0,
-		reuse:    900,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Gangrenous Touch of Zum`uul",
-		castTime: 3.2,
-		ticks:    0,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Devouring Darkness",
-		castTime: 3,
-		ticks:    13,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Pyrocruor",
-		castTime: 3,
-		ticks:    8,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Exile Undead",
-		castTime: 4.5,
-		ticks:    0,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Vexing Mordinia",
-		castTime: 5.5,
-		ticks:    9,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Cessation of Cor",
-		castTime: 3,
-		ticks:    9,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Conglaciation of Bone",
-		castTime: 6,
-		ticks:    0,
-		reuse:    12,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Chill Bones",
-		castTime: 6,
-		ticks:    0,
-		reuse:    12,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Touch of Night",
-		castTime: 3.2,
-		ticks:    0,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Plague",
-		castTime: 3,
-		ticks:    13,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Defoliation",
-		castTime: 5,
-		ticks:    0,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Splurt",
-		castTime: 3,
-		ticks:    16,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Envenomed Bolt",
-		castTime: 3,
-		ticks:    6,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Ignite Blood",
-		castTime: 3,
-		ticks:    7,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Bond of Death",
-		castTime: 7,
-		ticks:    9,
-		reuse:    10,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Vampiric Curse",
-		castTime: 4,
-		ticks:    9,
-		reuse:    10,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Boil Blood",
-		castTime: 3,
-		ticks:    7,
-		reuse:    1.5,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Heat Blood",
-		castTime: 3,
-		ticks:    6,
-		reuse:    4,
-		fizzle:   1.5,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Morternum",
-		castTime: 10,
-		ticks:    9,
-		reuse:    0,
-		fizzle:   0,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Soul Well",
-		castTime: 13.5,
-		ticks:    9,
-		reuse:    0,
-		fizzle:   0,
-	}
-	Spells = append(Spells, s)
-	s = Spell{
-		name:     "Torment of Shadows",
-		castTime: 9,
-		ticks:    16,
-		reuse:    0,
-		fizzle:   0,
-	}
-	Spells = append(Spells, s)
-}
-
-func checkKnownSpell(s string) bool {
-	for _, spell := range Spells {
-		// fmt.Printf("KnownSpell: %s UnknownSpell: %s\n", spell.name, s)
-		if strings.Compare(spell.name, s) == 0 {
-			return true
+func findSpellIDByName(name string) int {
+	// we need to check against overrides
+	for _, o := range configuration.Overrides {
+		if o.Name == name {
+			return o.SpellID
 		}
 	}
-	// fmt.Printf("Unknown Spell: %s\n", s)
-	return false
-}
-
-func getMaxTicks(s string) int {
-	for _, spell := range Spells {
-		if strings.Compare(spell.name, s) == 0 {
-			return spell.ticks
-		}
-	}
-	return 0
+	return SpellDB.FindIDByName(name)
 }
 
 func playAudio(say string) {
 	// Check if the audio exists, otherwise create it with tts
 	if _, err := os.Stat("audio" + "/" + say + ".mp3"); os.IsNotExist(err) {
+		Debug.Printf("Creating mp3 for %s", say)
 		speech := htgotts.Speech{Folder: "audio", Language: "en"}
-		speech.Speak(say)
+		err := speech.Speak(say)
+		if err != nil {
+			Err.Println(err)
+		}
 	}
-	f, err := os.Open("audio" + "/" + say + ".mp3")
+	hash := md5.Sum([]byte(say))
+	name := hex.EncodeToString(hash[:]) // tts uses hashes now, so we have to find the hash name
+	f, err := os.Open("audio" + "/" + name + ".mp3")
 	if err != nil {
-		log.Fatal(err)
+		Err.Fatalln(err)
 	}
 
 	streamer, format, err := mp3.Decode(f)
 	if err != nil {
-		log.Fatal(err)
+		Err.Fatalln(err)
 	}
 	defer streamer.Close()
-	speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
+	err = speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
+	if err != nil {
+		Err.Fatalln(err)
+	}
 	done := make(chan bool)
 	speaker.Play(beep.Seq(streamer, beep.Callback(func() {
 		done <- true

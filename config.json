@@ -1,9 +1,0 @@
-{
-	"LogLevel": 5,
-	"LogPath": "parse.log",
-	"EQLogPath": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Everquest F2P\\Logs\\eqlog_Mortimus_aradune.txt",
-	"EQBaseLogLine": "\\[(\\w{3} \\w{3} \\d{2} \\d{2}:\\d{2}:\\d{2} \\d{4})] (.+)",
-	"TickAlert": 1,
-	"ReadEntireLog": false,
-	"LogPollRate": 6
-}

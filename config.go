@@ -1,70 +1,96 @@
 package main
 
 import (
-	"encoding/json"
 	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
-)
 
-const configPath = "config.json"
-const failPath = "C:\\"
+	"github.com/pelletier/go-toml"
+)
 
 var configuration Configuration
 
-// Configuration stores all our user defined variables
-type Configuration struct {
-	LogLevel      int    `json:"LogLevel"`      // 0=Off,1=Error,2=Warn,3=Info,4=Debug
-	LogPath       string `json:"LogPath"`       // Where to write logs to
-	EQLogPath     string `json:"EQLogPath"`     // Where to read logs from
-	EQBaseLogLine string `json:"EQBaseLogLine"` // Regex for a eq log line
-	TickAlert     int    `json:"TickAlert"`     // Remaining ticks to issue an alert at
-	ReadEntireLog bool   `json:"ReadEntireLog"` // Read the entire log or only new
-	LogPollRate   int    `json:"LogPollRate"`   // How often to read the log if it reaches EOF in seconds
-}
+var configPath = "config.toml"
 
 func init() {
-	readConfig()
-	log.Printf("Configuration loaded:\n %+v\n", configuration)
+	ex, err := os.Executable()
+	if err != nil {
+		panic(err)
+	}
+	exPath := filepath.Dir(ex)
+	configuration, err = loadConfig(exPath + "/" + configPath)
+	if err != nil {
+		configuration, err = loadConfig(configPath)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		configPath = exPath + "/" + configPath
+	}
 }
 
-func readConfig() error {
-	dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
-	if err != nil {
-		log.Println(err)
-	}
-	if _, err := os.Stat(dir + "/" + configPath); os.IsNotExist(err) {
-		// path/to/whatever does not exist
-		dir, _ = os.Getwd()
-	}
-	if _, err := os.Stat(dir + "/" + configPath); os.IsNotExist(err) {
-		// path/to/whatever does not exist
-		dir = failPath
-	}
-	if _, err := os.Stat(dir + "/" + configPath); os.IsNotExist(err) {
-		// path/to/whatever does not exist
-		log.Fatal(err)
-	}
-	file, err := os.OpenFile(dir+"/"+configPath, os.O_RDONLY, 0444)
-	defer file.Close()
-	if err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(file)
-	err = decoder.Decode(&configuration)
-	if err != nil {
-		return err
-	}
-	return nil
+type Main struct {
+	ReadEntireLog         bool `comment:"Should we read the entire character log or just new entries"`
+	LogPollRate           int  `comment:"How often to check for new entries in the character log in seconds"`
+	RemainingTicksWarning int  `comment:"How many remaining ticks to issue a warning at"`
+	UseTTS                bool `comment:"Use TTS to announce spells on last tick"`
+	ShowUnknown           bool `comment:"Shows determinal spells before knowing their target"`
 }
 
-func saveConfig() error {
-	marshalledConfig, _ := json.MarshalIndent(configuration, "", "\t")
-	err := ioutil.WriteFile(configPath, marshalledConfig, 0644)
+type SpellOverride struct {
+	Name    string `comment:"Name of spell to override"`
+	SpellID int    `comment:"ID of overrode spell"`
+}
+
+type Everquest struct {
+	ExtendDotsPercent float64 `comment:"How long to extend dots due to focus 1.2 == timeburn"`
+	LogPath           string  `comment:"path to character log file"`
+	PlayerClass       string  `comment:"Class of character: Necromancer"`
+	SpellDB           string  `comment:"path to the lucydb spell database"`
+	TakenDamageRegex  string  `comment:"Regex to find when a mob takes damage from your dot"`
+	BeginCastingRegex string  `comment:"Regex to find when you cast a spell"`
+	InterruptedRegex  string  `comment:"Regex to find when your spell is interrupted"`
+	FizzledRegex      string  `comment:"Regex to find when you fizzle a spell"`
+	WornOffRegex      string  `comment:"Regex to find when your spell wears off"`
+	OverwrittenRegex  string  `comment:"Regex to find when your spell is overwritten"`
+	KilledRegex       string  `comment:"Regex to find when the npc is killed"`
+	DiedRegex         string  `comment:"Regex to find when you have died, removing all monitored dots"`
+	ResistedRegex     string  `comment:"Regex to find when your spell is resisted"`
+	DetrimentalHaste  float64 `comment:"How much spell haste for determinals, AH4 = 1.33"`
+}
+
+type Log struct {
+	Level int    `comment:"How much to log Warn:0 Err:1 Info:2 Debug:3"`
+	Path  string `comment:"Where to store the log file use linux formatting or escape slashes for windows"`
+}
+
+type Configuration struct {
+	Main      Main
+	Everquest Everquest
+	Log       Log
+	Overrides []SpellOverride `comment:"Spell that finds as wrong ID, force an ID here"`
+}
+
+func loadConfig(path string) (Configuration, error) {
+	config := Configuration{}
+	configFile, err := ioutil.ReadFile(path)
 	if err != nil {
-		return err
+		return config, err
 	}
-	log.Printf("Config Saved to %s\n", configPath)
-	return nil
+	err = toml.Unmarshal(configFile, &config)
+	if err != nil {
+		return config, err
+	}
+	return config, nil
+}
+
+func (c Configuration) save(path string) {
+	out, err := toml.Marshal(c)
+	if err != nil {
+		Err.Printf("Error marshalling config: %s", err.Error())
+	}
+	err = ioutil.WriteFile(path, out, 0644)
+	if err != nil {
+		Err.Printf("Error writing config: %s", err.Error())
+	}
 }
