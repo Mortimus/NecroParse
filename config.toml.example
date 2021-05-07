@@ -1,0 +1,65 @@
+[[Overrides]]
+    Name = "Saryrn's Kiss"
+    SpellID = 3306
+
+[Main]
+
+  # Guild (Discord Server) ID from right click copy ID
+  ReadEntireLog = true
+
+  # Discord token from discord developer page
+  LogPollRate = 6
+
+  UseTTS = true
+
+  ShowUnknown = false
+
+[Everquest]
+
+  # Google developer access token
+  ExtendDotsPercent = 1.0
+
+  # Last time attendance was updated from google sheets
+  LogPath = "C:/Program Files (x86)/Steam/steamapps/common/Everquest F2P/Logs/eqlog_Mortimus_aradune_trimmed.txt"
+
+  PlayerClass = "Necromancer"
+
+  # Google sheets player column for attendance
+  SpellDB = "spells.txt"
+
+  # Google sheets attendance points awarded column
+  TakenDamageRegex = "(.+) has taken (\\d+) damage from your (.+)."
+
+  # Google sheets sheet name for attendance
+  BeginCastingRegex = "You begin casting (.+)."
+
+  # Google sheets URL for attendance the last part
+  InterruptedRegex = "Your (.+) spell is interrupted."
+
+  # Google provided
+  FizzledRegex = "Your (.+) spell fizzles!"
+
+  # Google AuthURI
+  WornOffRegex = "Your (.+) spell has worn off of (.*)."
+
+  # Google project clientid
+  OverwrittenRegex = "Your (.+) spell on (.+) has been overwritten."
+
+  # Google client secret
+  KilledRegex = "(.+) has been slain by (.+)!"
+
+  # Last time DKP was updated from google sheets
+  DiedRegex = "(You) have been slain by (.+)!"
+
+  # Google sheets dkp column base 0
+  ResistedRegex = "(.+) resisted your (.+)!"
+
+  DetrimentalHaste = 1.33
+
+[Log]
+
+  # How much to log
+  Level = 3
+
+  # Where to store the log file use linux formatting or escape slashes for windows
+  Path = "necroSpells.log"
